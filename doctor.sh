@@ -13,9 +13,22 @@ if [[ "$(uname -m)" != "arm64" ]]; then
   exit 1
 fi
 
-python3 -c 'import fastapi, uvicorn' || {
+python3 -c 'import fastapi, httpx, uvicorn' || {
   echo "Missing Python runtime packages. Run: python3 -m pip install -r $PROJECT_DIR/requirements.txt"
   exit 1
 }
 
 echo "Runtime prerequisites are ready. Start hectiCat with: $PROJECT_DIR/run.sh"
+echo
+echo "Optional automation dependencies:"
+if curl --silent --fail http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+  echo "- Ollama: available"
+else
+  echo "- Ollama: unavailable at http://127.0.0.1:11434"
+fi
+
+if command -v hermes >/dev/null 2>&1; then
+  echo "- Hermes: $(command -v hermes)"
+else
+  echo "- Hermes: unavailable"
+fi

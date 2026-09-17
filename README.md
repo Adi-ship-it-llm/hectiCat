@@ -7,7 +7,7 @@ This package contains:
 - `tests/test_hecticat.py` — deterministic tests for core hectiCat logic.
 - `app.py` — local FastAPI runtime, GUI app, and durable SQLite schema foundation.
 - `run.sh` — starts the app on `127.0.0.1:8765`.
-- `doctor.sh` — checks the supported local runtime prerequisites.
+- `doctor.sh` — checks the supported local runtime prerequisites and reports optional automation dependencies.
 - `hectiCat App.command` — one-click launcher for the local GUI app.
 - `hectiCat Dashboard.command` — compatibility launcher that opens the same app.
 
@@ -21,6 +21,11 @@ server from the GUI.
 The local app opens at <http://127.0.0.1:8765>. By default, persistent local
 data is stored in `~/hectiCat`; set `HECTICAT_HOME` to use a different data
 directory.
+
+The app's health panel reports the SQLite database, browser profile, Ollama,
+Hermes, and configured model. Set `HECTICAT_MODEL` to use a model other than
+`qwen3.5:9b`, and set `HECTICAT_OLLAMA` if Ollama is not running at
+`http://127.0.0.1:11434`.
 
 ## Run from terminal
 

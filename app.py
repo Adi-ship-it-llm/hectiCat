@@ -7,13 +7,16 @@ minimal dashboard needed to operate those features safely.
 
 from __future__ import annotations
 
+import html
 import os
+import shutil
 import signal
 import sqlite3
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
 from fastapi import BackgroundTasks, FastAPI
 from fastapi.responses import HTMLResponse
 
@@ -21,6 +24,8 @@ from fastapi.responses import HTMLResponse
 BASE = Path(os.environ.get("HECTICAT_HOME", "~/hectiCat")).expanduser()
 DB = BASE / "data" / "hecticat.sqlite3"
 BROWSER_PROFILE = BASE / "browser-profile"
+MODEL = os.environ.get("HECTICAT_MODEL", "qwen3.5:9b")
+OLLAMA = os.environ.get("HECTICAT_OLLAMA", "http://127.0.0.1:11434")
 
 app = FastAPI(title="hectiCat", version="0.1.0")
 
@@ -139,6 +144,52 @@ def stop_process_after_response() -> None:
     os.kill(os.getpid(), signal.SIGTERM)
 
 
+def check_result(ok: bool, label: str, detail: str) -> dict[str, object]:
+    """Build a consistent health-check payload for API and dashboard use."""
+    return {"ok": ok, "label": label, "detail": detail}
+
+
+async def ollama_health() -> tuple[dict[str, object], dict[str, object]]:
+    """Check local Ollama and whether the configured model is available."""
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.get(f"{OLLAMA.rstrip('/')}/api/tags")
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        unavailable = check_result(False, "Unavailable", f"{type(exc).__name__}: {exc}")
+        missing_model = check_result(False, MODEL, "Ollama is not reachable.")
+        return unavailable, missing_model
+
+    model_names = {
+        str(item.get("name") or item.get("model"))
+        for item in payload.get("models", [])
+        if item.get("name") or item.get("model")
+    }
+    model_available = MODEL in model_names
+    ollama = check_result(True, "Available", OLLAMA)
+    model = check_result(
+        model_available,
+        MODEL,
+        "Model is installed." if model_available else "Configured model is not installed in Ollama.",
+    )
+    return ollama, model
+
+
+def render_check(name: str, check: dict[str, object]) -> str:
+    """Render one dashboard health row."""
+    css = "ok" if check["ok"] else "bad"
+    label = html.escape(str(check["label"]))
+    detail = html.escape(str(check["detail"]))
+    return (
+        f'<div class="health-check {css}">'
+        f"<b>{html.escape(name)}</b>"
+        f"<span>{label}</span>"
+        f"<p>{detail}</p>"
+        "</div>"
+    )
+
+
 @app.on_event("startup")
 async def startup() -> None:
     BASE.mkdir(parents=True, exist_ok=True)
@@ -148,13 +199,33 @@ async def startup() -> None:
 
 @app.get("/api/health")
 async def health() -> dict[str, object]:
-    """Report only local runtime state; dependency checks arrive in feature 2."""
+    """Report local runtime and automation dependency checks."""
+    ollama, model = await ollama_health()
+    hermes_path = shutil.which("hermes")
+    checks = {
+        "database": check_result(DB.exists(), "Ready" if DB.exists() else "Missing", str(DB)),
+        "browser_profile": check_result(
+            BROWSER_PROFILE.is_dir(),
+            "Ready" if BROWSER_PROFILE.is_dir() else "Missing",
+            str(BROWSER_PROFILE),
+        ),
+        "ollama": ollama,
+        "hermes": check_result(
+            hermes_path is not None,
+            "Available" if hermes_path else "Unavailable",
+            hermes_path or "Install Hermes before browser automation features are enabled.",
+        ),
+        "model": model,
+    }
     return {
-        "ok": DB.exists() and BROWSER_PROFILE.is_dir(),
+        "ok": all(bool(check["ok"]) for check in checks.values()),
         "service": "hectiCat",
         "version": app.version,
+        "model": MODEL,
+        "ollama": OLLAMA,
         "database": str(DB),
         "browser_profile": str(BROWSER_PROFILE),
+        "checks": checks,
     }
 
 
@@ -171,6 +242,11 @@ async def home() -> HTMLResponse:
     counts = dashboard_counts()
     status_text = "Ready" if health_state["ok"] else "Needs attention"
     status_class = "good" if health_state["ok"] else "warn"
+    checks = health_state["checks"]
+    health_checks = "\n".join(
+        render_check(name, checks[name])
+        for name in ("database", "browser_profile", "ollama", "hermes", "model")
+    )
     return HTMLResponse(
         f"""<!doctype html>
         <html lang="en">
@@ -316,6 +392,45 @@ async def home() -> HTMLResponse:
               background: var(--accent-soft);
               border-color: #b7d4c5;
             }}
+            .health-grid {{
+              display: grid;
+              grid-template-columns: repeat(5, 1fr);
+              gap: 12px;
+              margin-top: 16px;
+            }}
+            .health-check {{
+              border: 1px solid var(--line);
+              border-radius: 8px;
+              min-width: 0;
+              padding: 12px;
+              background: #f9faf5;
+            }}
+            .health-check b,
+            .health-check span {{
+              display: block;
+            }}
+            .health-check b {{
+              font-size: 13px;
+              color: var(--muted);
+              margin-bottom: 4px;
+            }}
+            .health-check span {{
+              color: var(--ink);
+              font-weight: 750;
+            }}
+            .health-check p {{
+              margin-top: 8px;
+              overflow-wrap: anywhere;
+              font-size: 13px;
+            }}
+            .health-check.ok {{
+              background: var(--accent-soft);
+              border-color: #b7d4c5;
+            }}
+            .health-check.bad {{
+              background: var(--warn-soft);
+              border-color: #edcf94;
+            }}
             .actions {{
               display: flex;
               flex-wrap: wrap;
@@ -361,7 +476,7 @@ async def home() -> HTMLResponse:
             }}
             .toast.show {{ display: block; }}
             @media (max-width: 780px) {{
-              header, .metric-row {{ grid-template-columns: 1fr; }}
+              header, .metric-row, .health-grid {{ grid-template-columns: 1fr; }}
               .status {{ justify-self: start; }}
               .panel {{ grid-column: span 12; }}
             }}
@@ -396,6 +511,14 @@ async def home() -> HTMLResponse:
                   <button class="button danger" type="button" id="stop-dashboard">Stop dashboard</button>
                 </div>
                 <div class="toast" id="shutdown-message">hectiCat is shutting down. You can close this browser tab.</div>
+              </div>
+
+              <div class="panel wide">
+                <h2>Local Health</h2>
+                <p>These checks confirm whether the local app, browser automation layer, and configured AI model are ready for the job application workflow.</p>
+                <div class="health-grid">
+                  {health_checks}
+                </div>
               </div>
 
               <div class="panel">
