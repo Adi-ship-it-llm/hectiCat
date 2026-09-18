@@ -12,6 +12,7 @@ import os
 import shutil
 import signal
 import sqlite3
+import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,6 +25,8 @@ from fastapi.responses import HTMLResponse
 BASE = Path(os.environ.get("HECTICAT_HOME", "~/hectiCat")).expanduser()
 DB = BASE / "data" / "hecticat.sqlite3"
 BROWSER_PROFILE = BASE / "browser-profile"
+LOG_DIR = BASE / "logs"
+OLLAMA_LOG = LOG_DIR / "ollama.log"
 MODEL = os.environ.get("HECTICAT_MODEL", "qwen3.5:9b")
 OLLAMA = os.environ.get("HECTICAT_OLLAMA", "http://127.0.0.1:11434")
 
@@ -176,6 +179,48 @@ async def ollama_health() -> tuple[dict[str, object], dict[str, object]]:
     return ollama, model
 
 
+async def is_ollama_reachable() -> bool:
+    """Return whether the configured Ollama server is responding."""
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.get(f"{OLLAMA.rstrip('/')}/api/tags")
+            response.raise_for_status()
+            return True
+    except httpx.HTTPError:
+        return False
+
+
+def start_ollama_process() -> dict[str, object]:
+    """Start Ollama silently in the background if the binary is installed."""
+    ollama_binary = shutil.which("ollama")
+    if ollama_binary is None:
+        return {
+            "ok": False,
+            "started": False,
+            "message": "Ollama is not installed or not on PATH.",
+        }
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log = OLLAMA_LOG.open("ab")
+    try:
+        subprocess.Popen(
+            [ollama_binary, "serve"],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    finally:
+        log.close()
+
+    return {
+        "ok": True,
+        "started": True,
+        "message": "Ollama start requested.",
+        "log": str(OLLAMA_LOG),
+    }
+
+
 def render_check(name: str, check: dict[str, object]) -> str:
     """Render one dashboard health row."""
     css = "ok" if check["ok"] else "bad"
@@ -234,6 +279,28 @@ async def shutdown(background_tasks: BackgroundTasks) -> dict[str, object]:
     """Stop the local dashboard server from the browser UI."""
     background_tasks.add_task(stop_process_after_response)
     return {"ok": True, "message": "hectiCat dashboard is shutting down."}
+
+
+@app.post("/api/ollama/start")
+async def start_ollama() -> dict[str, object]:
+    """Start the local Ollama server silently when it is not already running."""
+    if await is_ollama_reachable():
+        return {"ok": True, "started": False, "message": "Ollama is already running."}
+
+    result = start_ollama_process()
+    if not result["ok"]:
+        return result
+
+    for _ in range(20):
+        if await is_ollama_reachable():
+            result["ready"] = True
+            result["message"] = "Ollama is running."
+            return result
+        time.sleep(0.25)
+
+    result["ready"] = False
+    result["message"] = "Ollama was started but is not responding yet."
+    return result
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -508,8 +575,10 @@ async def home() -> HTMLResponse:
                 <div class="actions">
                   <a class="button" href="http://127.0.0.1:8765">Refresh</a>
                   <a class="button secondary" href="/api/health">Health</a>
+                  <button class="button secondary" type="button" id="start-ollama">Start Ollama</button>
                   <button class="button danger" type="button" id="stop-dashboard">Stop dashboard</button>
                 </div>
+                <div class="toast" id="ollama-message">Ollama start requested. Refreshing health shortly.</div>
                 <div class="toast" id="shutdown-message">hectiCat is shutting down. You can close this browser tab.</div>
               </div>
 
@@ -545,7 +614,9 @@ async def home() -> HTMLResponse:
           </main>
           <script>
             const stopButton = document.getElementById("stop-dashboard");
+            const startOllamaButton = document.getElementById("start-ollama");
             const shutdownMessage = document.getElementById("shutdown-message");
+            const ollamaMessage = document.getElementById("ollama-message");
 
             stopButton.addEventListener("click", async () => {{
               stopButton.disabled = true;
@@ -556,6 +627,20 @@ async def home() -> HTMLResponse:
               }} catch (error) {{
                 shutdownMessage.textContent = "Shutdown request sent. You can close this browser tab.";
               }}
+            }});
+
+            startOllamaButton.addEventListener("click", async () => {{
+              startOllamaButton.disabled = true;
+              startOllamaButton.textContent = "Starting...";
+              ollamaMessage.classList.add("show");
+              try {{
+                const response = await fetch("/api/ollama/start", {{ method: "POST" }});
+                const result = await response.json();
+                ollamaMessage.textContent = result.message || "Ollama start requested.";
+              }} catch (error) {{
+                ollamaMessage.textContent = "Could not request Ollama start.";
+              }}
+              window.setTimeout(() => window.location.reload(), 1500);
             }});
           </script>
         </body>

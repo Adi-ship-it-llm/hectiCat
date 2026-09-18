@@ -25,7 +25,9 @@ directory.
 The app's health panel reports the SQLite database, browser profile, Ollama,
 Hermes, and configured model. Set `HECTICAT_MODEL` to use a model other than
 `qwen3.5:9b`, and set `HECTICAT_OLLAMA` if Ollama is not running at
-`http://127.0.0.1:11434`.
+`http://127.0.0.1:11434`. Use **Start Ollama** in the app, or call
+`POST /api/ollama/start`, to silently start `ollama serve` when the Ollama
+binary is installed.
 
 ## Run from terminal
 
