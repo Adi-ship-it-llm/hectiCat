@@ -14,23 +14,99 @@ import signal
 import sqlite3
 import subprocess
 import time
+from contextlib import asynccontextmanager
+
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+
 
 
 BASE = Path(os.environ.get("HECTICAT_HOME", "~/hectiCat")).expanduser()
 DB = BASE / "data" / "hecticat.sqlite3"
+PROFILE_JSON = BASE / "profile.json"
+RESUMES_DIR = BASE / "resumes"
 BROWSER_PROFILE = BASE / "browser-profile"
 LOG_DIR = BASE / "logs"
 OLLAMA_LOG = LOG_DIR / "ollama.log"
 MODEL = os.environ.get("HECTICAT_MODEL", "qwen3.5:9b")
 OLLAMA = os.environ.get("HECTICAT_OLLAMA", "http://127.0.0.1:11434")
 
-app = FastAPI(title="hectiCat", version="0.1.0")
+
+
+def resumes_dir() -> Path:
+    """Return and ensure the directory used for storing uploaded resumes."""
+    directory = BASE / "resumes"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def extract_text(path: Path) -> str:
+    """Extract plain text from a PDF, DOCX, or TXT file."""
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(path))
+        pages = [page.extract_text() or "" for page in reader.pages]
+        return "\n".join(pages).strip()
+    elif suffix == ".docx":
+        from docx import Document
+
+        doc = Document(str(path))
+        return "\n".join(p.text for p in doc.paragraphs).strip()
+    elif suffix == ".txt":
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    else:
+        raise ValueError(f"Unsupported resume format: {suffix}")
+
+
+def auto_import_resumes() -> int:
+    """Scan the resumes directory for untracked files and import their text into the database."""
+    rdir = resumes_dir()
+    connection = db()
+    imported = 0
+    try:
+        known = {r["filename"] for r in connection.execute("SELECT filename FROM resumes")}
+        for item in sorted(rdir.glob("*")):
+            if item.is_file() and item.suffix.lower() in (".pdf", ".docx", ".txt") and item.name not in known:
+                try:
+                    text = extract_text(item)
+                    connection.execute(
+                        "INSERT INTO resumes(name, filename, text, active, created_at) VALUES(?, ?, ?, 1, ?)",
+                        (item.stem, item.name, text, now()),
+                    )
+                    imported += 1
+                except Exception:
+                    continue
+        if imported:
+            connection.commit()
+    finally:
+        connection.close()
+    return imported
+
+
+async def startup() -> None:
+    """Initialize directories, durable schema, and auto-import resumes."""
+    BASE.mkdir(parents=True, exist_ok=True)
+    BROWSER_PROFILE.mkdir(parents=True, exist_ok=True)
+    resumes_dir()
+    init_db()
+    auto_import_resumes()
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    await startup()
+    yield
+
+
+app = FastAPI(title="hectiCat", version="0.1.0", lifespan=lifespan)
+
 
 
 def now() -> str:
@@ -235,13 +311,6 @@ def render_check(name: str, check: dict[str, object]) -> str:
     )
 
 
-@app.on_event("startup")
-async def startup() -> None:
-    BASE.mkdir(parents=True, exist_ok=True)
-    BROWSER_PROFILE.mkdir(parents=True, exist_ok=True)
-    init_db()
-
-
 @app.get("/api/health")
 async def health() -> dict[str, object]:
     """Report local runtime and automation dependency checks."""
@@ -303,6 +372,116 @@ async def start_ollama() -> dict[str, object]:
     return result
 
 
+@app.post("/resumes/upload")
+async def resume_upload(request: Request, file: UploadFile = File(...)) -> Any:
+    """Upload a resume (PDF, DOCX, or TXT), store it, extract its text, and persist in database."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided.")
+
+    safe_name = Path(file.filename).name
+    suffix = Path(safe_name).suffix.lower()
+    if suffix not in (".pdf", ".docx", ".txt"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported resume format '{suffix}'. Supported formats: .pdf, .docx, .txt",
+        )
+
+    rdir = resumes_dir()
+    dest = rdir / safe_name
+    content = await file.read()
+    dest.write_bytes(content)
+
+    try:
+        text = extract_text(dest)
+    except Exception as exc:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to extract text from {safe_name}: {exc}",
+        )
+
+    connection = db()
+    try:
+        existing = connection.execute(
+            "SELECT id FROM resumes WHERE filename = ?", (safe_name,)
+        ).fetchone()
+        if existing:
+            connection.execute(
+                "UPDATE resumes SET name = ?, text = ?, active = 1, created_at = ? WHERE id = ?",
+                (dest.stem, text, now(), existing["id"]),
+            )
+            resume_id = existing["id"]
+        else:
+            cursor = connection.execute(
+                "INSERT INTO resumes (name, filename, text, active, created_at) VALUES (?, ?, ?, 1, ?)",
+                (dest.stem, safe_name, text, now()),
+            )
+            resume_id = cursor.lastrowid
+        connection.commit()
+    finally:
+        connection.close()
+
+    accept = request.headers.get("accept", "").lower()
+    if "application/json" in accept:
+        return JSONResponse(
+            {
+                "ok": True,
+                "id": resume_id,
+                "name": dest.stem,
+                "filename": safe_name,
+                "text_length": len(text),
+            }
+        )
+    return RedirectResponse("/", status_code=303)
+
+
+@app.get("/api/resumes")
+async def api_list_resumes() -> list[dict[str, object]]:
+    """Return all stored resumes in the library."""
+    connection = db()
+    try:
+        rows = connection.execute(
+            "SELECT id, name, filename, text, active, created_at FROM resumes ORDER BY id DESC"
+        ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "filename": row["filename"],
+                "active": bool(row["active"]),
+                "created_at": row["created_at"],
+                "text_length": len(row["text"] or ""),
+                "text_preview": (row["text"] or "")[:250],
+            }
+            for row in rows
+        ]
+    finally:
+        connection.close()
+
+
+@app.get("/api/resumes/{resume_id}")
+async def api_get_resume(resume_id: int) -> dict[str, object]:
+    """Return full details and extracted text for a specific resume."""
+    connection = db()
+    try:
+        row = connection.execute(
+            "SELECT id, name, filename, text, active, created_at FROM resumes WHERE id = ?",
+            (resume_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Resume not found.")
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "filename": row["filename"],
+            "text": row["text"],
+            "active": bool(row["active"]),
+            "created_at": row["created_at"],
+        }
+    finally:
+        connection.close()
+
+
 @app.get("/", response_class=HTMLResponse)
 async def home() -> HTMLResponse:
     health_state = await health()
@@ -314,6 +493,72 @@ async def home() -> HTMLResponse:
         render_check(name, checks[name])
         for name in ("database", "browser_profile", "ollama", "hermes", "model")
     )
+    resumes_dir_path = str(resumes_dir())
+
+    connection = db()
+    try:
+        resumes = connection.execute(
+            "SELECT id, name, filename, text, active, created_at FROM resumes ORDER BY id DESC"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    if resumes:
+        resume_rows = []
+        for r in resumes:
+            text_str = str(r["text"] or "")
+            words = len(text_str.split())
+            chars = len(text_str)
+            status_badge = (
+                '<span class="badge active">Active</span>'
+                if r["active"]
+                else '<span class="badge inactive">Inactive</span>'
+            )
+            r_id = r["id"]
+            r_name = html.escape(str(r["name"]))
+            r_fname = html.escape(str(r["filename"]))
+            r_created = html.escape(str(r["created_at"]))
+            r_text = html.escape(text_str)
+            resume_rows.append(
+                f"""<tr>
+                  <td><b>{r_id}</b></td>
+                  <td><strong>{r_name}</strong></td>
+                  <td><code>{r_fname}</code></td>
+                  <td>
+                    <div style="font-size: 13px; color: var(--muted); margin-bottom: 4px;">{words} words ({chars} chars)</div>
+                    <details class="preview-box">
+                      <summary>View extracted text</summary>
+                      <pre>{r_text}</pre>
+                    </details>
+                  </td>
+                  <td>{status_badge}</td>
+                  <td style="color: var(--muted); font-size: 13px;">{r_created}</td>
+                </tr>"""
+            )
+        resume_table_html = f"""
+        <div style="margin-top: 16px; overflow-x: auto;">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th style="width: 50px;">ID</th>
+                <th>Name</th>
+                <th>Filename</th>
+                <th>Extracted Content</th>
+                <th style="width: 80px;">Status</th>
+                <th style="width: 170px;">Added</th>
+              </tr>
+            </thead>
+            <tbody>
+              {''.join(resume_rows)}
+            </tbody>
+          </table>
+        </div>
+        """
+    else:
+        resume_table_html = """
+        <div class="empty">No resumes uploaded yet. Upload a PDF, DOCX, or TXT resume to start matching with job listings.</div>
+        """
+
     return HTMLResponse(
         f"""<!doctype html>
         <html lang="en">
@@ -541,7 +786,64 @@ async def home() -> HTMLResponse:
               color: #174432;
               padding: 12px;
             }}
-            .toast.show {{ display: block; }}
+            table.data-table {{
+              width: 100%;
+              border-collapse: collapse;
+              margin-top: 14px;
+              font-size: 14px;
+            }}
+            table.data-table th,
+            table.data-table td {{
+              padding: 10px 12px;
+              text-align: left;
+              border-bottom: 1px solid var(--line);
+              vertical-align: top;
+            }}
+            table.data-table th {{
+              background: #f0f2eb;
+              font-weight: 650;
+              color: var(--ink);
+            }}
+            table.data-table tr:hover td {{
+              background: #fafbf7;
+            }}
+            .badge {{
+              display: inline-block;
+              padding: 2px 8px;
+              border-radius: 999px;
+              font-size: 12px;
+              font-weight: 700;
+            }}
+            .badge.active {{
+              background: var(--accent-soft);
+              color: var(--accent);
+            }}
+            .badge.inactive {{
+              background: #e8e8e4;
+              color: var(--muted);
+            }}
+            details.preview-box {{
+              margin-top: 4px;
+            }}
+            details.preview-box summary {{
+              cursor: pointer;
+              color: var(--accent);
+              font-weight: 600;
+              font-size: 13px;
+            }}
+            details.preview-box pre {{
+              margin: 6px 0 0;
+              padding: 8px 12px;
+              background: #fafaf7;
+              border: 1px solid var(--line);
+              border-radius: 6px;
+              font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+              font-size: 12px;
+              white-space: pre-wrap;
+              word-break: break-word;
+              max-height: 180px;
+              overflow-y: auto;
+            }}
             @media (max-width: 780px) {{
               header, .metric-row, .health-grid {{ grid-template-columns: 1fr; }}
               .status {{ justify-self: start; }}
@@ -590,6 +892,22 @@ async def home() -> HTMLResponse:
                 </div>
               </div>
 
+              <div class="panel wide">
+                <div style="display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px;">
+                  <h2>Resume Library</h2>
+                  <span style="color: var(--muted); font-size: 13px;">Supports PDF, DOCX, and TXT</span>
+                </div>
+                <p>Upload your resume variants. hectiCat extracts and persists the full text locally for ATS matching and application drafting.</p>
+
+                <form method="post" action="/resumes/upload" enctype="multipart/form-data" style="margin-top: 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 14px; background: #f9faf5; border: 1px solid var(--line); border-radius: 8px;">
+                  <label for="resume-upload" style="font-weight: 650;">Upload resume:</label>
+                  <input type="file" id="resume-upload" name="file" accept=".pdf,.docx,.txt" required style="font-size: 14px;">
+                  <button class="button" type="submit">Upload &amp; Extract Text</button>
+                </form>
+
+                {resume_table_html}
+              </div>
+
               <div class="panel">
                 <h2>Application Pipeline</h2>
                 <p>Use this as the command center for each job as the workflow features come online.</p>
@@ -607,6 +925,7 @@ async def home() -> HTMLResponse:
                 <div class="empty">No jobs or applications have been tracked yet.</div>
                 <div class="path-list">
                   <div class="path-item"><span>Local database</span><code>{health_state["database"]}</code></div>
+                  <div class="path-item"><span>Resumes directory</span><code>{resumes_dir_path}</code></div>
                   <div class="path-item"><span>Browser profile</span><code>{health_state["browser_profile"]}</code></div>
                 </div>
               </div>
@@ -648,4 +967,7 @@ async def home() -> HTMLResponse:
     )
 
 
-init_db()
+try:
+    init_db()
+except Exception:
+    pass
