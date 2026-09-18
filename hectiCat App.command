@@ -14,10 +14,15 @@ mkdir -p "$LOG_DIR"
 
 echo "== hectiCat App =="
 
-if [[ "$(uname -s)" != "Darwin" ]]; then
-  echo "hectiCat currently targets macOS."
-  exit 1
-fi
+OS_NAME="$(uname -s)"
+case "$OS_NAME" in
+  Darwin) OPEN_CMD="open" ;;
+  Linux) OPEN_CMD="$(command -v xdg-open || echo "")" ;;
+  *)
+    echo "Unsupported OS: $OS_NAME. Use 'hectiCat App.bat' on Windows."
+    exit 1
+    ;;
+esac
 
 if [[ ! -x "$PY" ]]; then
   echo "Creating local Python environment..."
@@ -48,7 +53,11 @@ else
 fi
 
 echo "Opening $URL"
-open "$URL"
+if [[ -n "$OPEN_CMD" ]]; then
+  "$OPEN_CMD" "$URL"
+else
+  echo "Open $URL in your browser."
+fi
 
 echo
 echo "hectiCat is running locally. Use Stop dashboard in the app to quit the server."

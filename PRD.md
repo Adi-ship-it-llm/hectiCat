@@ -1,7 +1,7 @@
 # hectiCat Product Requirements Document (PRD)
 
 **Version:** 0.1 MVP  
-**Platform:** Apple Silicon macOS  
+**Platform:** macOS, Linux, Windows (core dashboard, and Hermes detection). Browser automation (Playwright) is not yet part of the shipped app; hectiCat's own one-click install of Hermes/Ollama remains macOS/Homebrew-only (`installer/hectiCat-OneClick.command`), though Hermes itself ships separate installers for macOS/Linux and Windows.  
 **Product type:** Local-first AI job discovery and application assistant
 
 ## 1. Product Summary
@@ -82,8 +82,8 @@ User reviews → explicitly approves the exact application → hectiCat stores a
 ## 7. Functional Requirements
 
 ### FR-01 Local runtime
-- Target Apple Silicon macOS.
-- Install into `~/hectiCat`.
+- Target macOS, Linux, and Windows for the core dashboard and resume workflow.
+- Install into the user's home directory under `hectiCat` (`HECTICAT_HOME` overrides).
 - Dashboard on `127.0.0.1:8765`.
 
 ### FR-02 Resume ingestion
@@ -211,7 +211,7 @@ MVP should provide:
 ## 12. Acceptance Criteria
 
 A release candidate must demonstrate:
-1. Fresh install succeeds on supported Apple Silicon macOS.
+1. Fresh install succeeds on supported macOS, Linux, and Windows systems.
 2. Dashboard starts on localhost.
 3. PDF resume import works.
 4. Job URL ingestion works.

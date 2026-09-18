@@ -278,13 +278,21 @@ def start_ollama_process() -> dict[str, object]:
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log = OLLAMA_LOG.open("ab")
+    detach_kwargs: dict[str, object] = (
+        {
+            "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.DETACHED_PROCESS
+        }
+        if os.name == "nt"
+        else {"start_new_session": True}
+    )
     try:
         subprocess.Popen(
             [ollama_binary, "serve"],
             stdout=log,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            start_new_session=True,
+            **detach_kwargs,
         )
     finally:
         log.close()

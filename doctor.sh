@@ -3,15 +3,16 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-if [[ "$(uname -s)" != "Darwin" ]]; then
-  echo "Unsupported OS: hectiCat targets macOS."
-  exit 1
-fi
+OS_NAME="$(uname -s)"
+case "$OS_NAME" in
+  Darwin|Linux) ;;
+  *)
+    echo "Unsupported OS: $OS_NAME. Use doctor.bat on Windows."
+    exit 1
+    ;;
+esac
 
-if [[ "$(uname -m)" != "arm64" ]]; then
-  echo "Unsupported CPU: hectiCat targets Apple Silicon (arm64)."
-  exit 1
-fi
+echo "OS: $OS_NAME ($(uname -m))"
 
 python3 -c 'import fastapi, httpx, uvicorn' || {
   echo "Missing Python runtime packages. Run: python3 -m pip install -r $PROJECT_DIR/requirements.txt"
