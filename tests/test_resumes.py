@@ -296,7 +296,8 @@ async def test_api_resumes_endpoints(app_mod):
 
 
 @pytest.mark.asyncio
-async def test_dashboard_renders_resume_library(app_mod):
+async def test_workspace_renders_resume_library(app_mod):
+    """GET / (user workspace) should display the Resume Library section."""
     c = app_mod.db()
     c.execute(
         "INSERT INTO resumes(name, filename, text, active, created_at) VALUES(?, ?, ?, 1, ?)",
@@ -309,12 +310,22 @@ async def test_dashboard_renders_resume_library(app_mod):
         transport=ASGITransport(app=app_mod.app),
         base_url="http://127.0.0.1:8765",
     )
+
+    # User workspace at /
     res = await client.get("/")
     assert res.status_code == 200
     content = res.text
-
     assert "Resume Library" in content
     assert "DevOps Specialist" in content
     assert "devops.txt" in content
     assert "Kubernetes, Terraform, CI/CD" in content
     assert "Upload &amp; Extract Text" in content
+    assert "hectiCat — Workspace" in content
+
+    # Admin dashboard at /admin
+    admin_res = await client.get("/admin")
+    assert admin_res.status_code == 200
+    admin_content = admin_res.text
+    assert "System Admin" in admin_content
+    assert "Local Health" in admin_content
+    assert "Resume Library" in admin_content

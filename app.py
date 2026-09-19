@@ -432,7 +432,14 @@ async def resume_upload(request: Request, file: UploadFile = File(...)) -> Any:
                 "text_length": len(text),
             }
         )
-    return RedirectResponse("/", status_code=303)
+
+    from urllib.parse import urlparse
+    referer = request.headers.get("referer", "/") or "/"
+    target_path = urlparse(referer).path
+    if target_path not in ("/admin", "/"):
+        target_path = "/"
+    return RedirectResponse(target_path, status_code=303)
+
 
 
 @app.get("/api/resumes")
@@ -483,7 +490,340 @@ async def api_get_resume(resume_id: int) -> dict[str, object]:
 
 
 @app.get("/", response_class=HTMLResponse)
-async def home() -> HTMLResponse:
+async def user_workspace() -> HTMLResponse:
+    """User-facing workspace: job discovery, resume library, application pipeline."""
+    health_state = await health()
+    counts = dashboard_counts()
+    system_ok = health_state["ok"]
+    status_text = "System ready" if system_ok else "Needs attention"
+    status_class = "good" if system_ok else "warn"
+
+    connection = db()
+    try:
+        resumes = connection.execute(
+            "SELECT id, name, filename, text, active, created_at FROM resumes ORDER BY id DESC"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    if resumes:
+        resume_rows = []
+        for r in resumes:
+            text_str = str(r["text"] or "")
+            words = len(text_str.split())
+            status_badge = (
+                '<span class="badge active">Active</span>'
+                if r["active"]
+                else '<span class="badge inactive">Inactive</span>'
+            )
+            r_id = r["id"]
+            r_name = html.escape(str(r["name"]))
+            r_fname = html.escape(str(r["filename"]))
+            r_text = html.escape(text_str)
+            resume_rows.append(
+                f"""<tr>
+                  <td><b>{r_id}</b></td>
+                  <td><strong>{r_name}</strong></td>
+                  <td><code>{r_fname}</code></td>
+                  <td>
+                    <div style="font-size: 13px; color: var(--muted); margin-bottom: 4px;">{words} words</div>
+                    <details class="preview-box">
+                      <summary>View extracted text</summary>
+                      <pre>{r_text}</pre>
+                    </details>
+                  </td>
+                  <td>{status_badge}</td>
+                </tr>"""
+            )
+        resume_table_html = f"""
+        <div style="margin-top: 16px; overflow-x: auto;">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th style="width: 50px;">ID</th>
+                <th>Name</th>
+                <th>Filename</th>
+                <th>Extracted Content</th>
+                <th style="width: 80px;">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {''.join(resume_rows)}
+            </tbody>
+          </table>
+        </div>
+        """
+    else:
+        resume_table_html = """
+        <div class="empty">No resumes uploaded yet. Upload a PDF, DOCX, or TXT resume to get started.</div>
+        """
+
+    pipeline_stages = [
+        ("Draft", counts["drafts"], "queue-item"),
+        ("In Review", 0, "queue-item"),
+        ("Filled", 0, "queue-item"),
+        ("Approved", 0, "queue-item"),
+        ("Submitted", counts["submitted"], "queue-item"),
+    ]
+    pipeline_html = "".join(
+        f'<div class="{cls}"><b>{stage}</b><p>{cnt} applications</p></div>'
+        for stage, cnt, cls in pipeline_stages
+    )
+
+    return HTMLResponse(
+        f"""<!doctype html>
+        <html lang="en">
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>hectiCat — Workspace</title>
+          <style>
+            :root {{
+              color-scheme: light;
+              --bg: #f6f7f4;
+              --ink: #1b1b18;
+              --muted: #66645d;
+              --line: #d8ddd2;
+              --panel: #fffffb;
+              --accent: #27624d;
+              --accent-soft: #e5f1eb;
+              --danger: #8d2d26;
+              --danger-soft: #f9e3df;
+              --warn: #9a5a00;
+              --warn-soft: #fff3d8;
+            }}
+            * {{ box-sizing: border-box; }}
+            body {{
+              margin: 0;
+              background: var(--bg);
+              color: var(--ink);
+              font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            }}
+            main {{
+              width: min(1120px, calc(100vw - 32px));
+              margin: 0 auto;
+              padding: 32px 0 64px;
+            }}
+            header {{
+              display: grid;
+              grid-template-columns: 1fr auto;
+              gap: 20px;
+              align-items: end;
+              padding: 0 0 28px;
+              border-bottom: 2px solid var(--line);
+            }}
+            h1 {{ margin: 0; font-size: clamp(28px, 5vw, 52px); line-height: 1; }}
+            h2 {{ margin: 0 0 8px; font-size: 17px; }}
+            h3 {{ margin: 0 0 6px; font-size: 15px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }}
+            p {{ margin: 0; color: var(--muted); }}
+            code {{
+              background: #efebe1; border: 1px solid var(--line); border-radius: 6px;
+              color: #2d2b26; padding: 2px 6px;
+            }}
+            a {{ color: var(--accent); font-weight: 650; }}
+            .tagline {{ font-size: 17px; color: var(--muted); margin-top: 6px; }}
+            .status-badge {{
+              display: inline-flex; align-items: center; gap: 8px;
+              border: 1px solid var(--line); border-radius: 999px;
+              padding: 8px 14px; background: var(--panel); font-weight: 700;
+              text-decoration: none; color: var(--ink); font-size: 14px;
+            }}
+            .status-badge .dot {{
+              width: 9px; height: 9px; border-radius: 50%; background: var(--accent);
+            }}
+            .status-badge.warn .dot {{ background: var(--warn); }}
+            nav {{
+              display: flex; gap: 12px; margin-top: 16px; flex-wrap: wrap;
+            }}
+            nav a {{
+              font-size: 14px; color: var(--muted); text-decoration: none;
+              border: 1px solid var(--line); border-radius: 999px;
+              padding: 5px 14px; background: var(--panel); font-weight: 500;
+              transition: border-color .15s;
+            }}
+            nav a:hover {{ border-color: var(--accent); color: var(--accent); }}
+            .sections {{ display: grid; gap: 32px; margin-top: 36px; }}
+            .section {{
+              background: var(--panel); border: 1px solid var(--line);
+              border-radius: 10px; padding: 22px 24px;
+            }}
+            .section-header {{
+              display: flex; align-items: baseline; justify-content: space-between;
+              flex-wrap: wrap; gap: 8px; margin-bottom: 12px;
+            }}
+            .coming-soon {{
+              display: inline-block; font-size: 11px; font-weight: 700;
+              padding: 2px 8px; border-radius: 999px;
+              background: var(--warn-soft); color: var(--warn);
+              border: 1px solid #edcf94; vertical-align: middle; margin-left: 8px;
+            }}
+            .url-form {{
+              display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px;
+              padding: 14px; background: #f9faf5; border: 1px solid var(--line);
+              border-radius: 8px; align-items: center; opacity: .6; pointer-events: none;
+            }}
+            .url-form input[type="url"] {{
+              flex: 1; min-width: 260px; padding: 8px 12px;
+              border: 1px solid var(--line); border-radius: 7px;
+              font-size: 14px; background: white;
+            }}
+            .button {{
+              appearance: none; border: 1px solid var(--accent); border-radius: 7px;
+              background: var(--accent); color: white; cursor: pointer;
+              display: inline-flex; align-items: center; min-height: 36px;
+              padding: 7px 14px; text-decoration: none; font-size: 14px; font-weight: 600;
+            }}
+            .button.secondary {{
+              background: transparent; color: var(--accent);
+            }}
+            .upload-form {{
+              display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+              margin-top: 14px; padding: 14px; background: #f9faf5;
+              border: 1px solid var(--line); border-radius: 8px;
+            }}
+            .empty {{
+              border: 1px dashed var(--line); border-radius: 8px;
+              color: var(--muted); margin-top: 14px; padding: 14px;
+            }}
+            table.data-table {{
+              width: 100%; border-collapse: collapse; font-size: 14px;
+            }}
+            table.data-table th, table.data-table td {{
+              padding: 10px 12px; text-align: left;
+              border-bottom: 1px solid var(--line); vertical-align: top;
+            }}
+            table.data-table th {{ background: #f0f2eb; font-weight: 650; }}
+            table.data-table tr:hover td {{ background: #fafbf7; }}
+            .badge {{
+              display: inline-block; padding: 2px 8px; border-radius: 999px;
+              font-size: 12px; font-weight: 700;
+            }}
+            .badge.active {{ background: var(--accent-soft); color: var(--accent); }}
+            .badge.inactive {{ background: #e8e8e4; color: var(--muted); }}
+            details.preview-box {{ margin-top: 4px; }}
+            details.preview-box summary {{
+              cursor: pointer; color: var(--accent); font-weight: 600; font-size: 13px;
+            }}
+            details.preview-box pre {{
+              margin: 6px 0 0; padding: 8px 12px; background: #fafaf7;
+              border: 1px solid var(--line); border-radius: 6px;
+              font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+              font-size: 12px; white-space: pre-wrap; word-break: break-word;
+              max-height: 180px; overflow-y: auto;
+            }}
+            .pipeline {{
+              display: grid;
+              grid-template-columns: repeat(5, 1fr);
+              gap: 12px; margin-top: 14px;
+            }}
+            .queue-item {{
+              border: 1px solid var(--line); border-radius: 8px;
+              padding: 14px; background: #f9faf5;
+            }}
+            .queue-item b {{ display: block; margin-bottom: 4px; font-size: 14px; }}
+            .queue-item p {{ font-size: 13px; }}
+            .safety-list {{ margin: 12px 0 0; padding: 0 0 0 18px; color: var(--muted); }}
+            .safety-list li {{ margin-bottom: 6px; font-size: 14px; }}
+            @media (max-width: 780px) {{
+              header {{ grid-template-columns: 1fr; }}
+              .status-badge {{ justify-self: start; }}
+              .pipeline {{ grid-template-columns: repeat(2, 1fr); }}
+            }}
+          </style>
+        </head>
+        <body>
+          <main>
+            <header>
+              <div>
+                <h1>hectiCat</h1>
+                <p class="tagline">Your local job-application workspace. Everything stays on this Mac.</p>
+                <nav>
+                  <a href="#job-discovery">Job Leads</a>
+                  <a href="#resume-library">Resumes</a>
+                  <a href="#pipeline">Applications</a>
+                  <a href="/admin">Admin ⚙️</a>
+                </nav>
+              </div>
+              <a class="status-badge {status_class}" href="/admin" title="Click to open System Admin">
+                <span class="dot"></span>
+                <span>{status_text}</span>
+              </a>
+            </header>
+
+            <div class="sections">
+
+              <!-- ── Section 1: Job Discovery ── -->
+              <section class="section" id="job-discovery">
+                <div class="section-header">
+                  <div>
+                    <h2>Job Discovery <span class="coming-soon">Coming soon</span></h2>
+                    <p>Paste a job listing URL and hectiCat will extract role details, score it against your resumes, and queue it for application.</p>
+                  </div>
+                </div>
+                <div class="url-form" aria-disabled="true" title="Job Discovery is not yet available">
+                  <input type="url" placeholder="https://jobs.example.com/posting/123" disabled>
+                  <button class="button" type="button" disabled>Add Job Lead</button>
+                </div>
+                <p style="margin-top: 10px; font-size: 13px;">
+                  {counts["tracked_jobs"]} job lead{"s" if counts["tracked_jobs"] != 1 else ""} tracked
+                  &nbsp;·&nbsp;
+                  {counts["drafts"]} draft{"s" if counts["drafts"] != 1 else ""}
+                  &nbsp;·&nbsp;
+                  {counts["submitted"]} submitted
+                </p>
+              </section>
+
+              <!-- ── Section 2: Resume Library ── -->
+              <section class="section" id="resume-library">
+                <div class="section-header">
+                  <div>
+                    <h2>Resume Library</h2>
+                    <p>Upload resume variants. hectiCat extracts and stores the full text locally for ATS matching and application drafting.</p>
+                  </div>
+                  <span style="color: var(--muted); font-size: 13px;">PDF · DOCX · TXT</span>
+                </div>
+                <form method="post" action="/resumes/upload" enctype="multipart/form-data" class="upload-form">
+                  <label for="resume-upload" style="font-weight: 650;">Upload resume:</label>
+                  <input type="file" id="resume-upload" name="file" accept=".pdf,.docx,.txt" required style="font-size: 14px;">
+                  <button class="button" type="submit">Upload &amp; Extract Text</button>
+                </form>
+                {resume_table_html}
+              </section>
+
+              <!-- ── Section 3: Application Pipeline ── -->
+              <section class="section" id="pipeline">
+                <div class="section-header">
+                  <div>
+                    <h2>Application Pipeline</h2>
+                    <p>Track every application as it moves from draft to submission.</p>
+                  </div>
+                </div>
+                <div class="pipeline">
+                  {pipeline_html}
+                </div>
+              </section>
+
+              <!-- ── Section 4: Safety Assurance ── -->
+              <section class="section" id="safety">
+                <h2>Safety Assurance</h2>
+                <p>hectiCat is designed to keep you in control and your data private.</p>
+                <ul class="safety-list">
+                  <li>🖥️ <strong>Local-only inference</strong> — all AI processing runs on your Mac via Ollama; no data leaves your machine.</li>
+                  <li>🔒 <strong>Zero stored credentials</strong> — hectiCat never saves passwords or session cookies.</li>
+                  <li>🛑 <strong>Protected-field stops</strong> — the browser agent pauses on sensitive fields and waits for your approval.</li>
+                  <li>✅ <strong>Per-application approval hash</strong> — each submission requires a unique token you explicitly confirm.</li>
+                </ul>
+              </section>
+
+            </div>
+          </main>
+        </body>
+        </html>"""
+    )
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_dashboard() -> HTMLResponse:
     health_state = await health()
     counts = dashboard_counts()
     status_text = "Ready" if health_state["ok"] else "Needs attention"
@@ -565,7 +905,7 @@ async def home() -> HTMLResponse:
         <head>
           <meta charset="utf-8">
           <meta name="viewport" content="width=device-width, initial-scale=1">
-          <title>hectiCat Dashboard</title>
+          <title>hectiCat — System Admin</title>
           <style>
             :root {{
               color-scheme: light;
@@ -855,8 +1195,9 @@ async def home() -> HTMLResponse:
           <main>
             <header>
               <div>
-                <h1>hectiCat</h1>
-                <p>Track job leads, resumes, application drafts, and submissions from this Mac.</p>
+                <a href="/" style="font-size: 13px; font-weight: 600; text-decoration: none; color: var(--muted); display: inline-flex; align-items: center; gap: 4px; margin-bottom: 10px;">← Workspace</a>
+                <h1>hectiCat <span style="font-size: 20px; font-weight: 500; color: var(--muted);">System Admin</span></h1>
+                <p>Runtime health, local services, and resume library management.</p>
               </div>
               <div class="status {status_class}" aria-label="Runtime status">
                 <span class="dot"></span>
@@ -875,7 +1216,7 @@ async def home() -> HTMLResponse:
                   <div class="metric"><strong>{counts["submitted"]}</strong><p>Submitted</p></div>
                 </div>
                 <div class="actions">
-                  <a class="button" href="http://127.0.0.1:8765">Refresh</a>
+                  <a class="button" href="/admin">Refresh</a>
                   <a class="button secondary" href="/api/health">Health</a>
                   <button class="button secondary" type="button" id="start-ollama">Start Ollama</button>
                   <button class="button danger" type="button" id="stop-dashboard">Stop dashboard</button>
