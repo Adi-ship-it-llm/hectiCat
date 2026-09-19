@@ -32,7 +32,7 @@ if curl --silent --fail "$URL/api/health" >/dev/null 2>&1; then
   echo "hectiCat is already running."
 else
   echo "Starting hectiCat..."
-  nohup "$PY" -m uvicorn app:app --host 127.0.0.1 --port 8765 >"$LOG_FILE" 2>&1 &
+  nohup "$PY" -m uvicorn app:app --host 127.0.0.1 --port 8765 --reload >"$LOG_FILE" 2>&1 &
   SERVER_PID="$!"
 
   for _ in {1..40}; do
